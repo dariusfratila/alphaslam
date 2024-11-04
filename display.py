@@ -20,3 +20,4 @@ class Display(object):
         surf[:, :, 0:3] = img.swapaxes(0, 1)
 
         pygame.display.update()
+
