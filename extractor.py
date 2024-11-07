@@ -1,7 +1,10 @@
+import torch
+import numpy as np
 from skimage.transform import EssentialMatrixTransform
 from skimage.measure import ransac
+from xfeat.accelerated_features.modules.xfeat import XFeat
 import cv2
-import numpy as np
+
 np.set_printoptions(suppress=True)
 
 
@@ -28,9 +31,8 @@ def extractRt(E):
 
 class Extractor(object):
     def __init__(self, K):
-        assert K.shape == (3, 3), "camera matrix K must be 3x3"
-        self.orb = cv2.ORB_create()
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        assert K.shape == (3, 3), "Camera matrix K must be 3x3"
+        self.xfeat = XFeat()
         self.last = None
         self.K = K
         self.Kinv = np.linalg.inv(K)
@@ -43,23 +45,29 @@ class Extractor(object):
         return int(round(ret[0])), int(round(ret[1]))
 
     def extract(self, img):
-        # detection
-        feats = cv2.goodFeaturesToTrack(np.mean(img, axis=2).astype(
-            np.uint8), 3000, qualityLevel=0.02, minDistance=1)
-        if feats is None or len(feats) < 8:
-            print("Insufficient features")
+        img_tensor = torch.from_numpy(img).permute(
+            2, 0, 1).unsqueeze(0).float() / 255.0
+        output = self.xfeat.detectAndCompute(img_tensor, top_k=3000)[0]
+        kps, des = output['keypoints'], output['descriptors']
+
+        if des is not None and not isinstance(des, np.ndarray):
+            des = des.cpu().numpy()
+
+        if not len(kps):
             return [], None
 
-        # extraction and matching
-        kps = [cv2.KeyPoint(x=f[0][0], y=f[0][1], size=20) for f in feats]
-        kps, des = self.orb.compute(img, kps)
+        kps = [(float(kp[0]), float(kp[1])) for kp in kps]
         ret = []
+
         if self.last:
-            matches = self.bf.knnMatch(des, self.last['des'], k=2)
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:
-                    kp1, kp2 = kps[m.queryIdx].pt, self.last['kps'][m.trainIdx].pt
-                    ret.append((kp1, kp2))
+            bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+            matches = sorted(
+                bf.match(des, self.last['des']), key=lambda x: x.distance)
+
+            for m in matches:
+                kp1 = kps[m.queryIdx]
+                kp2 = self.last['kps'][m.trainIdx]
+                ret.append((kp1, kp2))
 
         Rt = None
         if len(ret) >= 8:
@@ -68,15 +76,17 @@ class Extractor(object):
             ret[:, 1, :] = self.normalize(ret[:, 1, :])
 
             try:
-                model, inliers = ransac((ret[:, 0], ret[:, 1]), EssentialMatrixTransform,
-                                        min_samples=8, residual_threshold=0.005, max_trials=200)
+                model, inliers = ransac(
+                    (ret[:, 0], ret[:, 1]),
+                    EssentialMatrixTransform,
+                    min_samples=8,
+                    residual_threshold=0.005,
+                    max_trials=200
+                )
                 if inliers.any():
-                    ret = ret[inliers]
-                    Rt = extractRt(model.params)
-                else:
-                    print("no inliers found")
-            except Exception as e:
-                print(f"extraction error: {e}")
+                    ret, Rt = ret[inliers], extractRt(model.params)
+            except Exception:
+                pass
 
         self.last = {'kps': kps, 'des': des}
         return ret, Rt
